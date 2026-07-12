@@ -26,13 +26,15 @@ import logging
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from tempfile import SpooledTemporaryFile
+from typing import TYPE_CHECKING, get_args, get_type_hints
 
 from aiohttp import web
 from pydantic import TypeAdapter, ValidationError
 from pydantic_core import PydanticSerializationError, from_json, to_json
 
 from verifiers.v1.clients import ModelContext
+from verifiers.v1.decorators import invoke
 from verifiers.v1.dialects import DIALECTS, Dialect
 from verifiers.v1.dialects.base import is_sse_done_event
 from verifiers.v1 import graph
@@ -43,7 +45,14 @@ from verifiers.v1.errors import (
     UserError,
 )
 from verifiers.v1.trace import Trace
-from verifiers.v1.types import Messages, Tool
+from verifiers.v1.types import (
+    AssistantMessage,
+    Message,
+    MessageContent,
+    Messages,
+    Tool,
+    ToolMessage,
+)
 
 if TYPE_CHECKING:
     from verifiers.v1.mcp import Respond
@@ -58,6 +67,7 @@ logger = logging.getLogger(__name__)
 _MAX_REQUEST_BODY = 1024**3  # 1 GiB (aiohttp's default is 1 MiB)
 _KEEPALIVE_INTERVAL_SECONDS = 3
 _STREAM_QUEUE_MAXSIZE = 16
+_STREAM_MEMORY_BUFFER = 8 * 1024**2
 # The server binds loopback; callers reach it via localhost or a host tunnel (see `reachable_url`).
 _HOST = "127.0.0.1"
 
@@ -127,6 +137,8 @@ class RolloutSession:
     trace: Trace
     stops: list[Callable[[Trace], Awaitable[bool]]] = field(default_factory=list)
     limits: RolloutLimits = field(default_factory=RolloutLimits)
+    intercepts: list[Callable[..., Awaitable[object]]] = field(default_factory=list)
+    rewritten_response_ids: set[str] = field(default_factory=set)
     user: "Respond | None" = None
     """A user simulator the rollout sets before the harness runs (see `verifiers.v1.mcp.user`).
     When set, each model turn with no tool call is followed by the simulator's reply,
@@ -142,6 +154,47 @@ class RolloutSession:
     (and may swallow it, or exit non-zero), so the rollout re-raises this original error once the
     harness returns — recording the real `ProviderError` instead of a secondary `HarnessError`.
     Reset before each model turn, so a successful retry clears it."""
+
+    async def intercept(self, message: Message) -> Message | None:
+        """Return the first interceptor replacement, or None for native pass-through."""
+        try:
+            for interceptor in self.intercepts:
+                # The `message` annotation selects which messages an interceptor sees:
+                # `vf.AssistantMessage` / `vf.ToolMessage` filter, anything else sees all.
+                hint = get_type_hints(interceptor).get("message")
+                if hint is not None and not isinstance(message, get_args(hint) or hint):
+                    continue
+                replacement = await invoke(
+                    interceptor,
+                    {"message": message.model_copy(deep=True), "trace": self.trace},
+                )
+                if replacement is None:
+                    continue
+                if isinstance(replacement, str):
+                    # A string replaces the whole assistant turn — dropping its tool calls —
+                    # while a tool result keeps its identity fields and swaps only content.
+                    replacement = (
+                        AssistantMessage(content=replacement)
+                        if isinstance(message, AssistantMessage)
+                        else message.model_copy(update={"content": replacement})
+                    )
+                if type(replacement) is not type(message):
+                    raise TaskError(
+                        f"@intercept for {type(message).__name__} returned "
+                        f"{type(replacement).__name__}"
+                    )
+                if isinstance(replacement, AssistantMessage):
+                    # The rewrite carries no sampled identity: native provider state and
+                    # plain-text reasoning are dropped so committed == replayed everywhere.
+                    replacement = replacement.model_copy(
+                        update={"provider_state": None, "reasoning_content": None}
+                    )
+                return replacement
+        except RolloutError:
+            raise
+        except Exception as e:
+            raise TaskError(f"@intercept failed: {type(e).__name__}: {e}") from e
+        return None
 
     async def refused(self) -> str | None:
         """The framework's limits (turns / token budget) and `@stop` checks, run before each
@@ -249,6 +302,33 @@ class InterceptionServer:
         # alias after parsing so the wire body does not survive model inference.
         request._read_bytes = None
         del raw
+        if session.intercepts:
+            if body.get("previous_response_id") in session.rewritten_response_ids:
+                return self._fail(
+                    session,
+                    dialect,
+                    TaskError(
+                        "@intercept cannot safely continue a rewritten response by "
+                        "previous_response_id; replay the rewritten output in the request"
+                    ),
+                )
+            if request.path == "/v1/responses" and body.get("conversation") is not None:
+                return self._fail(
+                    session,
+                    dialect,
+                    TaskError(
+                        "@intercept requires stateless Responses requests; conversation "
+                        "state would retain the provider's original response"
+                    ),
+                )
+            if request.path == "/v1/chat/completions" and body.get("n", 1) != 1:
+                return self._fail(
+                    session,
+                    dialect,
+                    TaskError(
+                        "@intercept requires exactly one Chat Completions choice"
+                    ),
+                )
         logger.debug(
             "intercept %s: id=%s stream=%s",
             request.path,
@@ -275,6 +355,26 @@ class InterceptionServer:
             prompt = [*prompt, *session.opening]
             # If the simulator ended at the open (its task's `@stop` now fires), the loop's
             # `refused()` below halts the harness before any model call — no special-casing here.
+        if session.intercepts:
+            replacements: dict[str, MessageContent] = {}
+            try:
+                for message in graph.prepare_turn(session.trace, prompt).tail:
+                    if not isinstance(message, ToolMessage):
+                        continue
+                    replacement = await session.intercept(message)
+                    if replacement is not None:
+                        assert isinstance(replacement, ToolMessage)
+                        replacements[message.tool_call_id] = replacement.content
+            except RolloutError as e:
+                return self._fail(session, dialect, e)
+            if replacements:
+                body = dialect.rewrite_tool_results(body, replacements)
+                prompt, tools = dialect.parse_request(body)
+                logger.debug(
+                    "tool results intercepted: id=%s count=%d",
+                    session.trace.id,
+                    len(replacements),
+                )
         if dialect.streaming(body):
             return await self._stream(request, session, dialect, body, prompt, tools)
         headers = request.headers.copy()
@@ -349,6 +449,25 @@ class InterceptionServer:
                     e,
                 )
                 return web.json_response(dialect.error_body(str(e)), status=502)
+            try:
+                replacement = await session.intercept(response.message)
+                if replacement is not None:
+                    raw = dialect.rewrite_response(response.raw, replacement)
+                    response = dialect.parse_response(dialect.validate_response(raw))
+                    response.raw = raw
+                    if response.id:
+                        session.rewritten_response_ids.add(response.id)
+                    logger.debug("turn intercepted: id=%s", session.trace.id)
+            except RolloutError as e:
+                return self._fail(session, dialect, e)
+            except (
+                Exception
+            ) as e:  # a rewrite the dialect cannot serialize is a task bug
+                return self._fail(
+                    session,
+                    dialect,
+                    TaskError(f"@intercept failed: {type(e).__name__}: {e}"),
+                )
             # `Response.raw` is the full native provider object, or the renderer's synthesized
             # completion object, that the server serializes for the program.
             completion = response.raw
@@ -450,7 +569,8 @@ class InterceptionServer:
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
         )
         resp.content_type = reply.content_type.split(";")[0].strip()
-        # Parse complete events as they relay, avoiding a full-stream byte copy.
+        # Parse complete events as they relay. Intercepted streams are spooled until the complete
+        # assistant message has been classified; ordinary streams stay on the bounded hot path.
         parser = dialect.stream_parser()
         feed_event = parser.feed
         on_done = parser.on_done
@@ -461,67 +581,152 @@ class InterceptionServer:
         ready = asyncio.Event()
         producer = asyncio.create_task(_queue_chunks(reply.chunks, queue, ready))
         parser_error: Exception | None = None
+        event_sizes: list[int] = []
         # SSE events from the turn-ending one onward (the terminal event and any trailing
         # `[DONE]`), withheld until the turn is committed: a client that ends its turn on the
         # terminal event (e.g. codex on `response.completed`) would otherwise reach scoring
         # with the turn still unrecorded.
         deferred: list[bytes] = []
-        try:
-            await resp.prepare(request)
-            while True:
-                try:
-                    async with asyncio.timeout(_KEEPALIVE_INTERVAL_SECONDS):
-                        await ready.wait()
-                except TimeoutError:
-                    await resp.write(b": keepalive\n\n")
-                    continue
-                chunk = queue.get_nowait()
-                if queue.empty():
-                    ready.clear()
-                if chunk is None:
-                    await producer
-                    break
-                if deferred or dialect.is_terminal_event(chunk):
-                    if parser_error is None:
-                        try:
-                            if on_done is not None and is_sse_done_event(chunk):
-                                on_done()
-                            feed_event(chunk)
-                        except Exception as e:
-                            parser_error = e
-                    # forwarded after the turn is committed, below
-                    deferred.append(chunk)
-                    continue
-                await resp.write(chunk)
-                if parser_error is None:
-                    try:
-                        feed_event(chunk)
-                    except Exception as e:
-                        parser_error = e
-        except ConnectionResetError:
-            return resp
-        finally:
-            producer.cancel()
-            # Let a canceled producer enqueue EOF while unwinding.
-            if queue.full():
-                queue.get_nowait()
-            await asyncio.gather(producer, return_exceptions=True)
-            await reply.close()
+        next_keepalive = asyncio.get_running_loop().time() + _KEEPALIVE_INTERVAL_SECONDS
 
-        try:
+        def parse_event(chunk: bytes) -> None:
+            nonlocal parser_error
             if parser_error is not None:
-                raise parser_error
-            turn.commit(parser.finish())
-            if tools:  # record only on commit, like the non-streaming path
-                session.trace.tools = tools
-            logger.debug("intercept stream turn: id=%s", session.trace.id)
-        finally:
-            # Release the withheld events only now — after the commit — then close.
+                return
+            try:
+                if on_done is not None and is_sse_done_event(chunk):
+                    on_done()
+                feed_event(chunk)
+            except Exception as e:
+                parser_error = e
+
+        async def keepalive() -> None:
+            nonlocal next_keepalive
+            await resp.write(b": keepalive\n\n")
+            next_keepalive = (
+                asyncio.get_running_loop().time() + _KEEPALIVE_INTERVAL_SECONDS
+            )
+
+        async def end_stream() -> None:
             with contextlib.suppress(ConnectionResetError):
                 for event in deferred:
                     await resp.write(event)
                 await resp.write_eof()
-        return resp
+
+        with (
+            SpooledTemporaryFile(max_size=_STREAM_MEMORY_BUFFER)
+            if session.intercepts
+            else contextlib.nullcontext()
+        ) as buffer:
+            try:
+                await resp.prepare(request)
+                while True:
+                    try:
+                        async with asyncio.timeout(_KEEPALIVE_INTERVAL_SECONDS):
+                            await ready.wait()
+                    except TimeoutError:
+                        await keepalive()
+                        continue
+                    chunk = queue.get_nowait()
+                    if queue.empty():
+                        ready.clear()
+                    if chunk is None:
+                        await producer
+                        break
+                    if buffer is not None:
+                        buffer.write(chunk)
+                        event_sizes.append(len(chunk))
+                        parse_event(chunk)
+                        if asyncio.get_running_loop().time() >= next_keepalive:
+                            await keepalive()
+                        continue
+                    if deferred or dialect.is_terminal_event(chunk):
+                        parse_event(chunk)
+                        # forwarded after the turn is committed, below
+                        deferred.append(chunk)
+                        continue
+                    await resp.write(chunk)
+                    parse_event(chunk)
+            except ConnectionResetError:
+                return resp
+            finally:
+                producer.cancel()
+                # Let a canceled producer enqueue EOF while unwinding.
+                if queue.full():
+                    queue.get_nowait()
+                await asyncio.gather(producer, return_exceptions=True)
+                await reply.close()
+
+            try:
+                if parser_error is not None:
+                    # A spooled stream was never relayed: the client gets an empty stream
+                    # and fails the turn cleanly; nothing commits on either path.
+                    raise parser_error
+                response = parser.finish()
+            except Exception:
+                await end_stream()
+                raise
+            if buffer is not None:
+                intercept_task = asyncio.create_task(
+                    session.intercept(response.message)
+                )
+                try:
+                    while not intercept_task.done():
+                        await asyncio.wait(
+                            {intercept_task},
+                            timeout=_KEEPALIVE_INTERVAL_SECONDS,
+                        )
+                        if not intercept_task.done():
+                            await keepalive()
+                    replacement = await intercept_task
+                    if replacement is not None:
+                        raw = dialect.rewrite_response(response.raw, replacement)
+                        response = dialect.parse_response(
+                            dialect.validate_response(raw)
+                        )
+                        response.raw = raw
+                        if response.id:
+                            session.rewritten_response_ids.add(response.id)
+                        events = dialect.serialize_stream(raw)
+                    else:
+                        buffer.seek(0)
+                        events = (buffer.read(size) for size in event_sizes)
+                except ConnectionResetError:
+                    intercept_task.cancel()
+                    await asyncio.gather(intercept_task, return_exceptions=True)
+                    return resp
+                except Exception as e:
+                    session.error = (
+                        e
+                        if isinstance(e, RolloutError)
+                        else TaskError(f"@intercept failed: {type(e).__name__}: {e}")
+                    )
+                    logger.warning(
+                        "stream interception failed: id=%s %s",
+                        session.trace.id,
+                        session.error,
+                    )
+                    await end_stream()
+                    return resp
+
+                try:
+                    for event in events:
+                        if deferred or dialect.is_terminal_event(event):
+                            deferred.append(event)
+                        else:
+                            await resp.write(event)
+                except ConnectionResetError:
+                    return resp
+
+            try:
+                turn.commit(response)
+                if tools:  # record only on commit, like the non-streaming path
+                    session.trace.tools = tools
+                logger.debug("intercept stream turn: id=%s", session.trace.id)
+            finally:
+                # Release the withheld terminal events only now — after the commit.
+                await end_stream()
+            return resp
 
     async def handle_aux(
         self, request: web.Request, dialect: Dialect, route: str

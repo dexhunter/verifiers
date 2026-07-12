@@ -35,6 +35,8 @@ chmod +x {bin}
 class CodexHarnessConfig(HarnessConfig):
     version: str = "0.137.0"
     """Codex release to install (the `rust-v<version>` GitHub release); pinned for reproducibility."""
+    search: bool = False
+    """Enable codex's native web search (the provider-executed Responses `web_search` tool)."""
 
 
 class CodexHarness(Harness[CodexHarnessConfig]):
@@ -81,6 +83,7 @@ class CodexHarness(Harness[CodexHarnessConfig]):
         # come through literally); `requires_openai_auth=false` parses as a bool.
         argv = [
             CODEX_BIN,
+            *(["--search"] if self.config.search else []),
             "exec",
             "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
